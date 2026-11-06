@@ -1,5 +1,8 @@
 "use strict";
-/* Asisten AI (Anthropic) dengan keluaran SSE. Setara ai.php. Kunci hanya di Environment Variables Vercel. */
+/* Asisten AI dengan keluaran SSE. Setara ai.php. Kunci hanya di Environment Variables Vercel.
+   Dua penyedia didukung, dipilih otomatis lewat kunci mana yang diisi:
+   - GEMINI_API_KEY (Google Gemini, ada jatah gratis harian) -- dipakai duluan kalau diisi.
+   - ANTHROPIC_API_KEY (Claude, berbayar per pemakaian) -- cadangan kalau Gemini tidak diisi. */
 const c = require("../lib/core");
 const P = require("../lib/prompts.json");
 const MAX_IN = 12000;
@@ -8,8 +11,10 @@ const clean = s => (typeof s === "string" ? s.replace(/\r/g, "").replace(/[\u000
 const num = (k, d) => +c.env[k] || d;
 
 module.exports = async (req, res) => {
-  const key = c.env.ANTHROPIC_API_KEY;
-  if (req.method === "GET") return c.send(res, 200, { ok: true, ready: !!key, why: key ? "" : "no_key", max: MAX_IN });
+  const keyGemini = c.env.GEMINI_API_KEY, keyAnthropic = c.env.ANTHROPIC_API_KEY;
+  const provider = keyGemini ? "gemini" : (keyAnthropic ? "anthropic" : null);
+  const key = provider === "gemini" ? keyGemini : keyAnthropic;
+  if (req.method === "GET") return c.send(res, 200, { ok: true, ready: !!key, why: key ? "" : "no_key", max: MAX_IN, penyedia: provider || "" });
   if (req.method !== "POST" || !c.xhr(req)) return c.fail(res, 403, "Permintaan ditolak.");
   const user = c.session(req); if (!user) return c.fail(res, 401, "Silakan masuk dulu.");
   if (!key) return c.fail(res, 503, "Asisten AI belum diaktifkan oleh pengelola situs.");
@@ -38,9 +43,22 @@ module.exports = async (req, res) => {
   res.on("close", () => ctrl.abort());
   let up;
   try {
-    up = await fetch("https://api.anthropic.com/v1/messages", { method: "POST", signal: ctrl.signal,
-      headers: { "content-type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01" },
-      body: JSON.stringify({ model: c.env.AI_MODEL || "claude-sonnet-5-5", max_tokens: 8000, stream: true, system: P.system, messages: [{ role: "user", content: parts.join("\n\n") }] }) });
+    if (provider === "gemini") {
+      const model = c.env.GEMINI_MODEL || "gemini-3.8-flash";
+      up = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`, {
+        method: "POST", signal: ctrl.signal,
+        headers: { "content-type": "application/json", "x-goog-api-key": key },
+        body: JSON.stringify({
+          system_instruction: { parts: [{ text: P.system }] },
+          contents: [{ role: "user", parts: [{ text: parts.join("\n\n") }] }],
+          generationConfig: { maxOutputTokens: 8000 }
+        })
+      });
+    } else {
+      up = await fetch("https://api.anthropic.com/v1/messages", { method: "POST", signal: ctrl.signal,
+        headers: { "content-type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01" },
+        body: JSON.stringify({ model: c.env.AI_MODEL || "claude-sonnet-5-5", max_tokens: 8000, stream: true, system: P.system, messages: [{ role: "user", content: parts.join("\n\n") }] }) });
+    }
   } catch { return c.fail(res, 502, "Penyedia AI sedang gangguan. Coba lagi nanti."); }
   if (!up.ok) {
     console.error("[ai] upstream", up.status);
@@ -52,7 +70,7 @@ module.exports = async (req, res) => {
   res.setHeader("X-Accel-Buffering", "no");
   const out = d => res.write("data: " + JSON.stringify(d) + "\n\n");
   let buf = "", stop = "", dec = new TextDecoder(), failed = false;
-  const handle = block => {
+  const handleAnthropic = block => {
     for (const line of block.split("\n")) {
       if (!line.startsWith("data:")) continue;
       let j; try { j = JSON.parse(line.slice(5)); } catch { continue; }
@@ -61,13 +79,27 @@ module.exports = async (req, res) => {
       else if (j.type === "error") { failed = true; out({ error: "Penyedia AI mengalami gangguan di tengah jawaban." }); }
     }
   };
+  const handleGemini = block => {
+    for (const line of block.split("\n")) {
+      if (!line.startsWith("data:")) continue;
+      let j; try { j = JSON.parse(line.slice(5)); } catch { continue; }
+      if (j.error) { failed = true; out({ error: "Penyedia AI mengalami gangguan di tengah jawaban." }); continue; }
+      if (j.promptFeedback && j.promptFeedback.blockReason) { failed = true; out({ error: "Permintaan ditolak oleh penyaring keamanan penyedia AI. Coba ubah sedikit teksnya." }); continue; }
+      const cand = j.candidates && j.candidates[0];
+      if (!cand) continue;
+      const txt = ((cand.content && cand.content.parts) || []).map(p => p.text || "").join("");
+      if (txt) out({ t: txt });
+      if (cand.finishReason) stop = cand.finishReason;
+    }
+  };
+  const handle = provider === "gemini" ? handleGemini : handleAnthropic;
   try {
     for await (const chunk of up.body) {
       buf += dec.decode(chunk, { stream: true }).replace(/\r\n/g, "\n");
       let n; while ((n = buf.indexOf("\n\n")) >= 0) { handle(buf.slice(0, n)); buf = buf.slice(n + 2); }
     }
     if (buf.trim()) handle(buf);
-    if (!failed) out({ done: true, trunc: stop === "max_tokens" });
+    if (!failed) out({ done: true, trunc: stop === "max_tokens" || stop === "MAX_TOKENS" });
   } catch { if (!ctrl.signal.aborted) out({ error: "Koneksi ke penyedia AI terputus." }); }
   res.end();
 };
